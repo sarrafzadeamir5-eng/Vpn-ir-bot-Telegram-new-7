@@ -52,14 +52,16 @@ if not SUPABASE_KEY:
 
 print(f"🔑 تلاش برای اتصال به Supabase...")
 print(f"📡 URL: {SUPABASE_URL}")
-print(f"🔐 KEY: {SUPABASE_KEY[:20]}...")
 
 try:
+    if not SUPABASE_URL:
+        raise RuntimeError("SUPABASE_URL تنظیم نشده است")
     db = create_client(SUPABASE_URL, SUPABASE_KEY)
-    test = db.table("app_users").select("*").limit(1).execute()
+    db.table("app_users").select("telegram_id").limit(1).execute()
     print("✅ اتصال به Supabase برقرار شد!")
 except Exception as e:
-    print(f"⚠️ خطا در اتصال به Supabase: {e}")
+    print(f"❌ خطا در اتصال به Supabase: {e}")
+    raise SystemExit(1)
 
 CARD_NUMBER = os.getenv("CARD_NUMBER", "6280231392863212")
 CARD_OWNER = os.getenv("CARD_OWNER", "امیرحسین صراف زاده")
@@ -72,6 +74,9 @@ user_conversations = {}
 _bot_username = None
 _checkout_cache = {}
 _discount_builder = {}
+_wallet_lock = threading.RLock()
+_order_lock = threading.RLock()
+_receipt_order_cache = {}
 
 # ============================================================
 # توابع کمکی تاریخ
@@ -137,7 +142,7 @@ def gen_tracking_code(prefix):
     return f"{prefix}-{gen_code(6)}"
 
 def get_expiry_date(days=30):
-    return (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d %H:%M")
+    return (datetime.now(timezone.utc) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M UTC")
 
 def get_payment_info(amount):
     if amount >= SHABA_LIMIT:
@@ -241,21 +246,202 @@ def set_banned(telegram_id, banned):
         log.error(f"خطا در set_banned: {e}")
 
 def adjust_wallet(telegram_id, delta, reason, ref_order_id=None):
-    user = get_user(telegram_id, force_refresh=True)
-    if not user:
-        return None
-    new_balance = user["wallet_balance"] + delta
+    """Conditional wallet update with per-process locking and idempotency check."""
+    telegram_id = int(telegram_id)
+    delta = int(delta)
+    with _wallet_lock:
+        try:
+            if ref_order_id is not None:
+                existing = (db.table("wallet_transactions").select("id")
+                            .eq("telegram_id", telegram_id)
+                            .eq("ref_order_id", int(ref_order_id))
+                            .eq("reason", reason).limit(1).execute())
+                if existing.data:
+                    user = get_user(telegram_id, force_refresh=True)
+                    return int(user.get("wallet_balance") or 0) if user else None
+            for attempt in range(5):
+                user = get_user(telegram_id, force_refresh=True)
+                if not user:
+                    return None
+                current = int(user.get("wallet_balance") or 0)
+                new_balance = current + delta
+                if new_balance < 0:
+                    return None
+                updated = (db.table("app_users").update({"wallet_balance": new_balance})
+                           .eq("telegram_id", telegram_id).eq("wallet_balance", current).execute())
+                if not updated.data:
+                    time.sleep(0.05 * (attempt + 1))
+                    continue
+                try:
+                    db.table("wallet_transactions").insert({
+                        "telegram_id": telegram_id, "amount": delta, "reason": reason,
+                        "ref_order_id": ref_order_id
+                    }).execute()
+                except Exception as ledger_error:
+                    rollback = (db.table("app_users").update({"wallet_balance": current})
+                                .eq("telegram_id", telegram_id).eq("wallet_balance", new_balance).execute())
+                    if not rollback.data:
+                        log.critical(f"WALLET INCONSISTENCY user={telegram_id} delta={delta} order={ref_order_id}")
+                    raise ledger_error
+                _user_cache.pop(telegram_id, None)
+                return new_balance
+            return None
+        except Exception as e:
+            log.error(f"خطا در adjust_wallet: {e}")
+            return None
+
+# ============================================================
+# سفارش‌ها و کد تخفیف
+# ============================================================
+def create_order(telegram_id, product, base_amount, final_amount, order_type, tracking_prefix,
+                 discount_code=None, pay_method="card", gb=None, days=None, plan=None, status="pending"):
+    """Create an order using the schema already used by this bot."""
+    for _ in range(5):
+        tracking_code = gen_tracking_code(tracking_prefix)
+        row = {
+            "telegram_id": telegram_id,
+            "product": product,
+            "base_amount": int(base_amount),
+            "final_amount": int(final_amount),
+            "type": order_type,
+            "tracking_code": tracking_code,
+            "discount_code": discount_code,
+            "pay_method": pay_method,
+            "gb": gb,
+            "days": days,
+            "plan": plan,
+            "status": status,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        try:
+            res = db.table("orders").insert(row).execute()
+            if res.data:
+                return res.data[0]
+        except Exception as e:
+            # Retry only for likely tracking-code collisions.
+            log.warning(f"خطا در ساخت سفارش: {e}")
+    return None
+
+def get_order(order_id):
     try:
-        db.table("app_users").update({"wallet_balance": new_balance}).eq("telegram_id", telegram_id).execute()
-        db.table("wallet_transactions").insert({
-            "telegram_id": telegram_id, "amount": delta, "reason": reason, "ref_order_id": ref_order_id
-        }).execute()
-        if telegram_id in _user_cache:
-            _user_cache[telegram_id]["wallet_balance"] = new_balance
-        return new_balance
+        res = db.table("orders").select("*").eq("id", int(order_id)).limit(1).execute()
+        return res.data[0] if res.data else None
     except Exception as e:
-        log.error(f"خطا در adjust_wallet: {e}")
+        log.error(f"خطا در get_order: {e}")
         return None
+
+def get_latest_pending_order(telegram_id):
+    try:
+        res = (db.table("orders").select("*")
+               .eq("telegram_id", telegram_id)
+               .eq("status", "pending")
+               .order("created_at", desc=True).limit(1).execute())
+        return res.data[0] if res.data else None
+    except Exception as e:
+        log.error(f"خطا در get_latest_pending_order: {e}")
+        return None
+
+def get_pending_orders(telegram_id, limit=10):
+    try:
+        res = (db.table("orders").select("*").eq("telegram_id", int(telegram_id))
+               .eq("status", "pending").order("created_at", desc=True).limit(limit).execute())
+        return res.data or []
+    except Exception as e:
+        log.error(f"خطا در get_pending_orders: {e}")
+        return []
+
+def update_order_status(order_id, status, server_info=None, expected_status=None):
+    try:
+        payload = {"status": status}
+        if server_info is not None:
+            payload["server_info"] = server_info
+        q = db.table("orders").update(payload).eq("id", int(order_id))
+        if expected_status is not None:
+            q = q.eq("status", expected_status)
+        return bool(q.execute().data)
+    except Exception as e:
+        log.error(f"خطا در update_order_status: {e}")
+        return False
+
+def check_discount_code(code, plan_key=None):
+    code = (code or "").strip().upper()
+    if not code:
+        return None, "❌ کد تخفیف خالی است."
+    try:
+        res = db.table("discount_codes").select("*").eq("code", code).limit(1).execute()
+        if not res.data:
+            return None, "❌ کد تخفیف پیدا نشد."
+        discount = res.data[0]
+        if not discount.get("active", False):
+            return None, "❌ این کد تخفیف غیرفعال است."
+        if discount.get("expires_at"):
+            try:
+                expires = datetime.fromisoformat(str(discount["expires_at"]).replace("Z", "+00:00"))
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=timezone.utc)
+                if expires <= datetime.now(timezone.utc):
+                    return None, "❌ اعتبار این کد تخفیف تمام شده است."
+            except ValueError:
+                return None, "❌ تاریخ اعتبار کد تخفیف نامعتبر است."
+        max_uses = discount.get("max_uses")
+        used = int(discount.get("used_count") or 0)
+        if max_uses is not None and used >= int(max_uses):
+            return None, "❌ ظرفیت استفاده از این کد تمام شده است."
+        discount_plan = discount.get("plan") or "all"
+        if discount_plan != "all" and discount_plan != plan_key:
+            return None, "❌ این کد برای این سرویس قابل استفاده نیست."
+        percent = int(discount.get("percent") or 0)
+        if not 1 <= percent <= 100:
+            return None, "❌ درصد تخفیف این کد نامعتبر است."
+        return discount, None
+    except Exception as e:
+        log.error(f"خطا در check_discount_code: {e}")
+        return None, "❌ خطا در بررسی کد تخفیف."
+
+def consume_discount_code(code):
+    """Increment use count. Idempotency is enforced by callers before confirmation."""
+    code = (code or "").strip().upper()
+    if not code:
+        return False
+    try:
+        res = db.table("discount_codes").select("*").eq("code", code).limit(1).execute()
+        if not res.data:
+            return False
+        d = res.data[0]
+        used = int(d.get("used_count") or 0)
+        max_uses = d.get("max_uses")
+        if not d.get("active", False) or (max_uses is not None and used >= int(max_uses)):
+            return False
+        upd = (db.table("discount_codes").update({"used_count": used + 1})
+               .eq("code", code).eq("used_count", used).execute())
+        return bool(upd.data)
+    except Exception as e:
+        log.error(f"خطا در consume_discount_code: {e}")
+        return False
+
+def process_referral_commission(order):
+    """Credit referral commission once per order."""
+    try:
+        if not order or order.get("type") == "wallet_topup":
+            return False
+        buyer = get_user(int(order["telegram_id"]))
+        if not buyer or not buyer.get("referred_by"):
+            return False
+        referrer_id = int(buyer["referred_by"])
+        # Prevent duplicate commission using the transaction reference.
+        existing = (db.table("wallet_transactions").select("id")
+                    .eq("telegram_id", referrer_id)
+                    .eq("ref_order_id", order["id"]).eq("reason", "referral_commission")
+                    .limit(1).execute())
+        if existing.data:
+            return True
+        commission = int(round(int(order["final_amount"]) * REFERRAL_PERCENT / 100))
+        if commission <= 0:
+            return True
+        return adjust_wallet(referrer_id, commission, "referral_commission", ref_order_id=order["id"]) is not None
+    except Exception as e:
+        log.error(f"خطا در process_referral_commission: {e}")
+        return False
 
 # ============================================================
 # کیبوردها
@@ -295,11 +481,11 @@ def vpn_keyboard():
     keyboard.add(InlineKeyboardButton("🔙 برگشت", callback_data="back"))
     return keyboard
 
-def confirm_keyboard(user_id):
+def confirm_keyboard(order_id):
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
-        InlineKeyboardButton("✅ تایید", callback_data=f"confirm_{user_id}"),
-        InlineKeyboardButton("❌ رد", callback_data=f"reject_{user_id}")
+        InlineKeyboardButton("✅ تایید", callback_data=f"confirm_order_{order_id}"),
+        InlineKeyboardButton("❌ رد", callback_data=f"reject_order_{order_id}")
     )
     return keyboard
 
@@ -807,22 +993,36 @@ def handle_payment_method(call):
     final_amount = cart["final_amount"]
 
     if call.data == "pay_wallet":
-        user = ensure_user_exists(user_id)
-        if not user or user["wallet_balance"] < final_amount:
-            bot.answer_callback_query(call.id, "❌ موجودی کافی نیست.", show_alert=True)
-            return
-        bot.answer_callback_query(call.id, "✅")
-        order = create_order(
-            user_id, cart["product"], cart["base_amount"], final_amount,
-            cart["kind"], cart["tracking_prefix"], discount_code=cart.get("discount_code"),
-            pay_method="wallet", gb=cart.get("gb"), days=cart.get("days"), plan=cart.get("plan_key"),
-            status="confirmed"
-        )
-        if order:
-            adjust_wallet(user_id, -final_amount, "order_payment", ref_order_id=order["id"])
+        with _order_lock:
+            user = ensure_user_exists(user_id)
+            if not user or int(user.get("wallet_balance") or 0) < final_amount:
+                bot.answer_callback_query(call.id, "❌ موجودی کافی نیست.", show_alert=True)
+                return
+            order = create_order(
+                user_id, cart["product"], cart["base_amount"], final_amount,
+                cart["kind"], cart["tracking_prefix"], discount_code=cart.get("discount_code"),
+                pay_method="wallet", gb=cart.get("gb"), days=cart.get("days"), plan=cart.get("plan_key"),
+                status="pending"
+            )
+            if not order:
+                bot.answer_callback_query(call.id, "❌ ساخت سفارش ناموفق بود.", show_alert=True)
+                return
+            new_balance = adjust_wallet(user_id, -final_amount, "order_payment", ref_order_id=order["id"])
+            if new_balance is None:
+                update_order_status(order["id"], "rejected", expected_status="pending")
+                bot.answer_callback_query(call.id, "❌ پرداخت کیف پول انجام نشد؛ دوباره تلاش کن.", show_alert=True)
+                return
+            if not update_order_status(order["id"], "confirmed", expected_status="pending"):
+                # If another retry already confirmed it, the debit is idempotent by ref_order_id.
+                latest = get_order(order["id"])
+                if not latest or latest.get("status") != "confirmed":
+                    log.critical(f"WALLET ORDER STATUS ERROR order={order['id']}")
+                    bot.answer_callback_query(call.id, "❌ پرداخت ثبت شد ولی وضعیت سفارش نامشخص است. با پشتیبانی تماس بگیر.", show_alert=True)
+                    return
+                order = latest
             process_referral_commission(order)
-            if cart.get("discount_code"):
-                consume_discount_code(cart["discount_code"])
+            if cart.get("discount_code") and not consume_discount_code(cart["discount_code"]):
+                log.warning(f"مصرف کد تخفیف ناموفق بود: {cart['discount_code']} / order={order['id']}")
             safe_edit(call.message.chat.id, call.message.message_id, f"""✅ <b>پرداخت از کیف پول انجام شد!</b>
 ━━━━━━━━━━━━━━
 📦 {cart['product']}
@@ -830,7 +1030,8 @@ def handle_payment_method(call):
 ━━━━━━━━━━━━━━
 ⏳ سرویس به‌زودی توسط ادمین ارسال می‌شه.""")
             notify_admin_new_order(order)
-            del _checkout_cache[user_id]
+            _checkout_cache.pop(user_id, None)
+        bot.answer_callback_query(call.id, "✅ پرداخت انجام شد")
         return
 
     bot.answer_callback_query(call.id, "💳")
@@ -840,9 +1041,8 @@ def handle_payment_method(call):
         pay_method="card", gb=cart.get("gb"), days=cart.get("days"), plan=cart.get("plan_key"),
         status="pending"
     )
-    if order and cart.get("discount_code"):
-        consume_discount_code(cart["discount_code"])
     if order:
+        _receipt_order_cache[user_id] = order["id"]
         safe_edit(call.message.chat.id, call.message.message_id, f"""🛒 <b>سفارش شما</b>
 ━━━━━━━━━━━━━━
 📦 {cart['product']}
@@ -1269,6 +1469,23 @@ def support_admin(call):
 # ============================================================
 # دریافت عکس رسید
 # ============================================================
+@bot.callback_query_handler(func=lambda call: call.data.startswith("receipt_order_"))
+def select_receipt_order(call):
+    user_id = call.from_user.id
+    try:
+        order_id = int(call.data.replace("receipt_order_", "", 1))
+    except ValueError:
+        bot.answer_callback_query(call.id, "❌ سفارش نامعتبر است.", show_alert=True)
+        return
+    order = get_order(order_id)
+    if not order or int(order.get("telegram_id")) != user_id or order.get("status") != "pending":
+        bot.answer_callback_query(call.id, "❌ این سفارش دیگر قابل پرداخت نیست.", show_alert=True)
+        return
+    _receipt_order_cache[user_id] = order_id
+    bot.answer_callback_query(call.id, "✅ سفارش انتخاب شد")
+    bot.send_message(call.message.chat.id, f"📤 حالا عکس رسید سفارش <code>{order['tracking_code']}</code> رو بفرست.", parse_mode="HTML")
+
+
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     user_id = message.from_user.id
@@ -1279,10 +1496,27 @@ def handle_photo(message):
         bot.reply_to(message, f"⚠️ اول عضو کانال {CHANNEL_ID} شو.")
         return
 
-    order = get_latest_pending_order(user_id)
-    if not order:
+    pending_orders = get_pending_orders(user_id, limit=10)
+    selected_id = _receipt_order_cache.get(user_id)
+    if selected_id:
+        selected = next((o for o in pending_orders if int(o["id"]) == int(selected_id)), None)
+        if selected:
+            pending_orders = [selected]
+        else:
+            _receipt_order_cache.pop(user_id, None)
+    if not pending_orders:
         bot.reply_to(message, "❌ سفارش فعالی نداری.")
         return
+    if len(pending_orders) > 1:
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        for o in pending_orders[:8]:
+            keyboard.add(InlineKeyboardButton(
+                f"🔖 {o['tracking_code']} | {o['final_amount']:,} تومان",
+                callback_data=f"receipt_order_{o['id']}"
+            ))
+        bot.reply_to(message, "⚠️ چند سفارش پرداخت‌نشده داری. اول سفارش مربوط به این رسید رو انتخاب کن:", reply_markup=keyboard)
+        return
+    order = pending_orders[0]
 
     try:
         file_id = message.photo[-1].file_id
@@ -1298,8 +1532,9 @@ def handle_photo(message):
 🆔 {user_id}
 📦 {order['product']}
 💰 {order['final_amount']:,} تومان
-🔖 {order['tracking_code']}""", reply_markup=confirm_keyboard(user_id), parse_mode="HTML")
+🔖 {order['tracking_code']}""", reply_markup=confirm_keyboard(order["id"]), parse_mode="HTML")
         os.remove(filename)
+        _receipt_order_cache.pop(user_id, None)
         bot.reply_to(message, "✅ رسید شما دریافت شد! منتظر تایید ادمین باش.")
     except telebot.apihelper.ApiTelegramException as e:
         log.error(f"خطای تلگرام هنگام ارسال رسید: {e}")
@@ -1324,16 +1559,51 @@ def notify_admin_new_order(order):
 # ============================================================
 @bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_"))
 def confirm_order_cb(call):
-    user_id = int(call.data.replace("confirm_", ""))
-    order = get_latest_pending_order(user_id)
-    if not order:
-        bot.answer_callback_query(call.id, "❌ سفارشی نیست!")
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ دسترسی غیرمجاز!", show_alert=True)
         return
 
-    if order["type"] == "wallet_topup":
-        bot.answer_callback_query(call.id, "✅")
-        update_order_status(order["id"], "delivered")
-        adjust_wallet(user_id, order["final_amount"], "topup", ref_order_id=order["id"])
+    data = call.data
+    try:
+        if data.startswith("confirm_order_"):
+            order_id = int(data.replace("confirm_order_", "", 1))
+            order = get_order(order_id)
+        else:
+            # Backward compatibility with old receipt buttons.
+            user_id = int(data.replace("confirm_", "", 1))
+            order = get_latest_pending_order(user_id)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "❌ شناسه سفارش نامعتبر است!", show_alert=True)
+        return
+
+    if not order or order.get("status") != "pending":
+        bot.answer_callback_query(call.id, "❌ این سفارش دیگر در انتظار تایید نیست.", show_alert=True)
+        return
+
+    user_id = int(order["telegram_id"])
+
+    if order.get("type") == "wallet_topup":
+        with _order_lock:
+            current_status = order.get("status")
+            if current_status == "pending":
+                if not update_order_status(order["id"], "processing", expected_status="pending"):
+                    bot.answer_callback_query(call.id, "❌ سفارش قبلاً پردازش شده است.", show_alert=True)
+                    return
+            elif current_status != "processing":
+                bot.answer_callback_query(call.id, "❌ این سفارش دیگر قابل پردازش نیست.", show_alert=True)
+                return
+
+            new_balance = adjust_wallet(user_id, int(order["final_amount"]), "topup", ref_order_id=order["id"])
+            if new_balance is None:
+                log.error(f"شارژ سفارش در وضعیت processing باقی ماند تا دوباره قابل بررسی باشد: {order['id']}")
+                bot.answer_callback_query(call.id, "❌ شارژ انجام نشد؛ سفارش برای بررسی مجدد نگه داشته شد.", show_alert=True)
+                return
+            if not update_order_status(order["id"], "delivered", expected_status="processing"):
+                latest = get_order(order["id"])
+                if not latest or latest.get("status") != "delivered":
+                    log.critical(f"TOPUP STATUS ERROR order={order['id']}")
+                    bot.answer_callback_query(call.id, "❌ شارژ ثبت شد ولی وضعیت سفارش نامشخص است. بررسی لازم است.", show_alert=True)
+                    return
         try:
             bot.send_message(user_id, f"✅ کیف پولت شارژ شد!\n💰 {order['final_amount']:,} تومان اضافه شد.")
         except telebot.apihelper.ApiTelegramException:
@@ -1342,17 +1612,24 @@ def confirm_order_cb(call):
             bot.edit_message_caption(f"✅ شارژ کیف پول انجام شد!\n👤 {user_id}", call.message.chat.id, call.message.message_id)
         except telebot.apihelper.ApiTelegramException:
             pass
+        bot.answer_callback_query(call.id, "✅")
         return
 
-    update_order_status(order["id"], "confirmed")
+    if not update_order_status(order["id"], "confirmed", expected_status="pending"):
+        bot.answer_callback_query(call.id, "❌ تایید سفارش ناموفق بود.", show_alert=True)
+        return
+
+    # Discount is consumed only after actual payment confirmation.
+    if order.get("discount_code"):
+        consume_discount_code(order["discount_code"])
     process_referral_commission(order)
 
-    if order["type"] == "stars":
+    if order.get("type") == "stars":
         try:
             bot.send_message(user_id, f"✅ خرید تایید شد!\n📦 {order['product']}")
         except telebot.apihelper.ApiTelegramException:
             pass
-        update_order_status(order["id"], "delivered")
+        update_order_status(order["id"], "delivered", expected_status="confirmed")
         try:
             bot.edit_message_caption(f"✅ استارز ارسال شد!\n👤 {user_id}", call.message.chat.id, call.message.message_id)
         except telebot.apihelper.ApiTelegramException:
@@ -1362,8 +1639,10 @@ def confirm_order_cb(call):
 
     bot.answer_callback_query(call.id, "📤")
     try:
-        bot.edit_message_caption(f"📝 سرور رو ارسال کن:\n👤 {user_id}\n📦 {order['product']}\n🔖 {order['tracking_code']}",
-                                  call.message.chat.id, call.message.message_id)
+        bot.edit_message_caption(
+            f"📝 سرور رو ارسال کن:\n👤 {user_id}\n📦 {order['product']}\n🔖 {order['tracking_code']}",
+            call.message.chat.id, call.message.message_id
+        )
     except telebot.apihelper.ApiTelegramException:
         pass
     msg = bot.send_message(call.message.chat.id, "📤 لطفاً سرور رو ارسال کن (متن یا عکس):")
@@ -1405,7 +1684,7 @@ def send_server_to_user(message, order_id, user_id):
 🌐 اطلاعات سرور:
 {caption_text}""", parse_mode="HTML")
             os.remove(filename)
-            update_order_status(order_id, "delivered", server_info=caption_text)
+            update_order_status(order_id, "delivered", server_info=caption_text, expected_status="confirmed")
         else:
             server_text = message.text.strip()
             if not server_text:
@@ -1421,7 +1700,7 @@ def send_server_to_user(message, order_id, user_id):
 ━━━━━━━━━━━━━━
 🌐 اطلاعات سرور:
 {server_text}""", parse_mode="HTML")
-            update_order_status(order_id, "delivered", server_info=server_text)
+            update_order_status(order_id, "delivered", server_info=server_text, expected_status="confirmed")
 
         bot.reply_to(message, "✅ سرور ارسال شد!")
     except telebot.apihelper.ApiTelegramException as e:
@@ -1433,19 +1712,35 @@ def send_server_to_user(message, order_id, user_id):
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("reject_"))
 def reject_order_cb(call):
-    bot.answer_callback_query(call.id, "❌")
-    user_id = int(call.data.replace("reject_", ""))
-    order = get_latest_pending_order(user_id)
-    if order:
-        update_order_status(order["id"], "rejected")
+    if call.from_user.id != ADMIN_ID:
+        bot.answer_callback_query(call.id, "❌ دسترسی غیرمجاز!", show_alert=True)
+        return
+    try:
+        if call.data.startswith("reject_order_"):
+            order_id = int(call.data.replace("reject_order_", "", 1))
+            order = get_order(order_id)
+        else:
+            user_id = int(call.data.replace("reject_", "", 1))
+            order = get_latest_pending_order(user_id)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, "❌ شناسه سفارش نامعتبر است!", show_alert=True)
+        return
+    if not order or order.get("status") != "pending":
+        bot.answer_callback_query(call.id, "❌ این سفارش دیگر در انتظار تایید نیست.", show_alert=True)
+        return
+    if not update_order_status(order["id"], "rejected", expected_status="pending"):
+        bot.answer_callback_query(call.id, "❌ سفارش قبلاً پردازش شده است.", show_alert=True)
+        return
+    user_id = int(order["telegram_id"])
     try:
         bot.send_message(user_id, "❌ خرید شما رد شد. برای توضیحات با پشتیبانی تماس بگیرید.")
     except telebot.apihelper.ApiTelegramException:
         pass
     try:
-        bot.edit_message_caption(f"❌ رد شد!\n👤 {user_id}", call.message.chat.id, call.message.message_id)
+        bot.edit_message_caption(f"❌ رد شد!\n👤 {user_id}\n🔖 {order['tracking_code']}", call.message.chat.id, call.message.message_id)
     except telebot.apihelper.ApiTelegramException as e:
         log.warning(f"edit_message_caption failed: {e}")
+    bot.answer_callback_query(call.id, "❌")
 
 # ============================================================
 # گزینه تحویل سرور
@@ -2541,8 +2836,10 @@ def addcode_cmd(message):
     code = args[1].strip().upper()
     try:
         percent = int(args[2])
+        if not 1 <= percent <= 100:
+            raise ValueError
     except ValueError:
-        bot.reply_to(message, "❌ درصد باید عدد باشه.")
+        bot.reply_to(message, "❌ درصد باید عددی بین ۱ تا ۱۰۰ باشه.")
         return
     max_uses = int(args[3]) if len(args) > 3 and args[3].isdigit() else None
     expires_at = None
