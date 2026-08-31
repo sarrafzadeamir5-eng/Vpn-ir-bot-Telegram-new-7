@@ -620,7 +620,7 @@ def safe_edit(chat_id, message_id, text, reply_markup=None, parse_mode="HTML"):
             log.warning(f"edit failed: {e}")
 
 _membership_cache = {}
-MEMBERSHIP_CACHE_SECONDS = 300
+MEMBERSHIP_CACHE_SECONDS = 2
 
 def is_member(user_id):
     now = time.time()
@@ -743,6 +743,7 @@ def help_cmd(message):
 @bot.callback_query_handler(func=lambda call: call.data == "check_membership")
 def check_membership(call):
     user_id = call.from_user.id
+    _membership_cache.pop(user_id, None)
     if is_member(user_id):
         bot.answer_callback_query(call.id, "✅")
         create_or_update_user(user_id, call.from_user.username)
