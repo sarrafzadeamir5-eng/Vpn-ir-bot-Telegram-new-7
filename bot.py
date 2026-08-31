@@ -622,21 +622,62 @@ def safe_edit(chat_id, message_id, text, reply_markup=None, parse_mode="HTML"):
 _membership_cache = {}
 MEMBERSHIP_CACHE_SECONDS = 2
 
-def is_member(user_id):
+def is_member(user_id, force_refresh=False):
+    """Check channel membership with a short cache and useful Telegram errors."""
     now = time.time()
-    cached = _membership_cache.get(user_id)
-    if cached and cached[1] > now:
-        return cached[0]
+
+    if not force_refresh:
+        cached = _membership_cache.get(user_id)
+        if cached and cached[1] > now:
+            return cached[0]
+
     try:
         member = bot.get_chat_member(CHANNEL_ID, user_id)
-        result = member.status in ["member", "administrator", "creator"]
-    except telebot.apihelper.ApiTelegramException:
-        result = False
-    except Exception as e:
-        log.error(f"خطای غیرمنتظره در چک عضویت: {e}")
-        result = False
-    _membership_cache[user_id] = (result, now + MEMBERSHIP_CACHE_SECONDS)
-    return result
+        status = getattr(member, "status", None)
+
+        # Normal member/admin/owner
+        if status in ("member", "administrator", "creator"):
+            result = True
+
+        # Telegram can return restricted for a member whose permissions
+        # are limited. They are still a channel member if not kicked/left.
+        elif status == "restricted":
+            result = not bool(getattr(member, "is_member", False)) is False
+            # Prefer Telegram's explicit is_member field when available.
+            result = bool(getattr(member, "is_member", False))
+
+        else:
+            result = False
+
+        _membership_cache[user_id] = (
+            result,
+            now + MEMBERSHIP_CACHE_SECONDS
+        )
+        return result
+
+    except telebot.apihelper.ApiTelegramException as e:
+        # IMPORTANT: don't silently convert every Telegram error to
+        # "user is not a member". Log the real reason.
+        log.error(
+            "Membership check failed | user_id=%s | channel=%s | "
+            "error_code=%s | description=%s",
+            user_id,
+            CHANNEL_ID,
+            getattr(e, "error_code", None),
+            getattr(e, "description", str(e)),
+        )
+        _membership_cache[user_id] = (False, now + MEMBERSHIP_CACHE_SECONDS)
+        return False
+
+    except Exception:
+        log.exception(
+            "Unexpected membership check error | user_id=%s | channel=%s",
+            user_id,
+            CHANNEL_ID,
+        )
+        _membership_cache[user_id] = (False, now + MEMBERSHIP_CACHE_SECONDS)
+        return False
+
 
 def welcome_text(first_name):
     return f"""👋 <b>سلام {first_name} عزیز، خوش اومدی!</b>
@@ -744,7 +785,7 @@ def help_cmd(message):
 def check_membership(call):
     user_id = call.from_user.id
     _membership_cache.pop(user_id, None)
-    if is_member(user_id):
+    if is_member(user_id, force_refresh=True):
         bot.answer_callback_query(call.id, "✅")
         create_or_update_user(user_id, call.from_user.username)
         safe_edit(call.message.chat.id, call.message.message_id, "✅ عضویت شما تایید شد!")
